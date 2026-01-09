@@ -38,6 +38,7 @@ def fetch_hourly(symbol):
 
 def run():
     price_cache = {}
+    print("RUN FUNCTION ENTERED")
 
     with get_conn() as conn:
         with conn.cursor() as cur:
