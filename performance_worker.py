@@ -13,11 +13,10 @@ def run():
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            # 1) Fetch alerts not yet evaluated
             cur.execute("""
                 SELECT
                     a.id,
-                    a.ticker,
+                    a.symbol,
                     a.type,
                     a.signal_time,
                     a.price,
@@ -28,16 +27,14 @@ def run():
                 WHERE p.alert_id IS NULL
                 LIMIT 50;
             """)
+
             alerts = cur.fetchall()
             print(f"Fetched {len(alerts)} alerts")
 
-            if not alerts:
-                return
-
-            for alert_id, ticker, side, signal_time, entry_price, rating in alerts:
-                exit_price = entry_price  # TEMP: neutral exit
+            for alert_id, symbol, side, signal_time, entry_price, rating in alerts:
+                exit_price = entry_price          # neutral exit (temporary)
                 exit_time = datetime.now(timezone.utc)
-                return_pct = 0.0
+                return_pct = 0.0                  # neutral return
 
                 cur.execute("""
                     INSERT INTO alert_performance (
@@ -55,7 +52,7 @@ def run():
                     VALUES (%s,%s,%s,%s,%s,0,%s,%s,%s,%s)
                 """, (
                     alert_id,
-                    ticker,
+                    symbol,
                     side,
                     signal_time,
                     entry_price,
