@@ -1,11 +1,20 @@
 import os
 import psycopg2
+import yfinance as yf
 from datetime import datetime, timezone
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def get_last_price(symbol: str) -> float | None:
+    try:
+        t = yf.Ticker(symbol)
+        data = t.fast_info
+        return data.get("lastPrice")
+    except Exception:
+        return None
 
 def run():
     print("PERFORMANCE WORKER RUNNING")
@@ -32,9 +41,18 @@ def run():
             print(f"Fetched {len(alerts)} alerts")
 
             for alert_id, symbol, side, signal_time, entry_price, rating in alerts:
-                exit_price = entry_price          # neutral exit (temporary)
+
+                exit_price = get_last_price(symbol)
+                if exit_price is None:
+                    print(f"Price fetch failed for {symbol}, skipping")
+                    continue
+
+                if side.upper() == "BULL":
+                    return_pct = (exit_price - entry_price) / entry_price * 100
+                else:  # BEAR
+                    return_pct = (entry_price - exit_price) / entry_price * 100
+
                 exit_time = datetime.now(timezone.utc)
-                return_pct = 0.0                  # neutral return
 
                 cur.execute("""
                     INSERT INTO alert_performance (
@@ -62,7 +80,7 @@ def run():
                     rating
                 ))
 
-                print(f"Inserted performance for alert {alert_id}")
+                print(f"Inserted real performance for alert {alert_id}")
 
         conn.commit()
 
