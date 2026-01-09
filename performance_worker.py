@@ -1,30 +1,42 @@
 import os
 import psycopg2
 import yfinance as yf
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DATABASE_URL = os.environ["DATABASE_URL"]
-BATCH_SIZE = 50   # safe default
+
+HORIZONS = [1, 4, 24]   # hours
+BATCH_SIZE = 50        # alerts per run (safe)
+LOOKBACK_DAYS = 5      # enough for intraday fetch
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-def get_last_close(symbol: str):
+def fetch_intraday(symbol: str):
     """
-    Guaranteed price source:
-    - Uses last available daily close
-    - Works when market is closed
-    - Returns None only if symbol is invalid
+    Returns a dict: {datetime_utc: close_price}
+    Uses 60m candles (stable, low rate).
     """
     try:
         t = yf.Ticker(symbol)
-        hist = t.history(period="2d", interval="1d")
+        hist = t.history(
+            period=f"{LOOKBACK_DAYS}d",
+            interval="60m",
+            auto_adjust=False
+        )
         if hist.empty:
-            return None
-        return float(hist["Close"].iloc[-1])
+            return {}
+
+        series = {}
+        for ts, row in hist.iterrows():
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            series[ts.astimezone(timezone.utc)] = float(row["Close"])
+
+        return series
     except Exception as e:
         print(f"[PRICE ERROR] {symbol}: {e}")
-        return None
+        return {}
 
 def run():
     print("PERFORMANCE WORKER RUNNING")
@@ -32,65 +44,91 @@ def run():
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            # 1) Fetch alerts not yet evaluated
+            # ---- fetch alerts needing at least one horizon ----
             cur.execute("""
                 SELECT
                     a.id,
                     a.symbol,
                     a.type,
                     a.signal_time,
-                    a.price,
-                    a.rating
+                    a.price
                 FROM alerts a
-                LEFT JOIN alert_performance p
-                  ON p.alert_id = a.id
-                WHERE p.alert_id IS NULL
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT unnest(%s::int[]) AS h
+                    ) horizons
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM alert_performance p
+                        WHERE p.alert_id = a.id
+                          AND p.horizon_hours = horizons.h
+                    )
+                )
                 ORDER BY a.signal_time ASC
                 LIMIT %s;
-            """, (BATCH_SIZE,))
+            """, (HORIZONS, BATCH_SIZE))
 
             alerts = cur.fetchall()
             print(f"Fetched {len(alerts)} alerts")
 
-            for alert_id, symbol, side, signal_time, entry_price, rating in alerts:
+            price_cache = {}
 
-                exit_price = get_last_close(symbol)
-                if exit_price is None:
-                    print(f"[SKIP] No price for {symbol}")
+            for alert_id, symbol, side, signal_time, entry_price in alerts:
+
+                if symbol not in price_cache:
+                    price_cache[symbol] = fetch_intraday(symbol)
+
+                series = price_cache[symbol]
+                if not series:
                     continue
 
-                if side.upper() == "BULL":
-                    return_pct = (exit_price - entry_price) / entry_price * 100
-                else:  # BEAR
-                    return_pct = (entry_price - exit_price) / entry_price * 100
+                for h in HORIZONS:
+                    # skip if already computed
+                    cur.execute("""
+                        SELECT 1 FROM alert_performance
+                        WHERE alert_id = %s AND horizon_hours = %s
+                    """, (alert_id, h))
+                    if cur.fetchone():
+                        continue
 
-                cur.execute("""
-                    INSERT INTO alert_performance (
+                    cutoff = signal_time + timedelta(hours=h)
+
+                    # find last close <= cutoff
+                    eligible = [
+                        (ts, px) for ts, px in series.items()
+                        if ts <= cutoff
+                    ]
+                    if not eligible:
+                        continue
+
+                    eligible.sort(key=lambda x: x[0], reverse=True)
+                    exit_time, exit_price = eligible[0]
+
+                    if side.upper() == "BULL":
+                        ret = (exit_price - entry_price) / entry_price * 100
+                    else:  # BEAR
+                        ret = (entry_price - exit_price) / entry_price * 100
+
+                    cur.execute("""
+                        INSERT INTO alert_performance (
+                            alert_id,
+                            horizon_hours,
+                            exit_time,
+                            exit_price,
+                            return_pct
+                        )
+                        VALUES (%s,%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING
+                    """, (
                         alert_id,
-                        symbol,
-                        type,
-                        alert_time,
-                        entry_price,
-                        horizon_hours,
+                        h,
                         exit_time,
                         exit_price,
-                        return_pct,
-                        rating
-                    )
-                    VALUES (%s,%s,%s,%s,%s,0,%s,%s,%s,%s)
-                """, (
-                    alert_id,
-                    symbol,
-                    side,
-                    signal_time,
-                    entry_price,
-                    datetime.now(timezone.utc),
-                    exit_price,
-                    return_pct,
-                    rating
-                ))
+                        ret
+                    ))
 
-                print(f"[OK] alert {alert_id} {symbol} return={return_pct:.2f}%")
+                    print(f"[OK] alert {alert_id} {symbol} {h}h = {ret:.2f}%")
 
         conn.commit()
 
